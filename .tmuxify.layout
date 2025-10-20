@@ -1,0 +1,2 @@
+git 1 . /home/ascaletty23/export-esp.sh
+nvim 1 nvim src/bin/main.rs
