@@ -9,10 +9,7 @@ use core::fmt::Alignment;
 use core::pin::Pin;
 
 use alloc::string::ToString;
-use eg_seven_segment::SevenSegmentStyleBuilder;
 
-use bt_hci::cmd::info;
-use bt_hci::controller::ExternalController;
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_net::driver::Driver;
@@ -30,24 +27,19 @@ use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::{clock, peripherals, rng, spi, Async, Blocking, DriverMode};
 use esp_hal::{clock::CpuClock, gpio::OutputConfig};
-use esp_wifi::ble::controller::BleConnector;
+use ieee80211::{match_frames, mgmt_frame::BeaconFrame};
 use mipidsi::options::Orientation;
 use mipidsi::Display;
 use panic_rtt_target as _;
-
-use esp_hal::{
-    delay::Delay,
-    gpio::{Io, Level, Output},
-    rtc_cntl::Rtc,
-    spi::master::{AnySpi, Spi},
-    timer::timg::TimerGroup as Spi_time,
-};
 
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{Circle, Primitive, PrimitiveStyle, Triangle},
     text::Text,
+};
+use esp_hal::{
+    clock::CpuClock, interrupt::software::SoftwareInterruptControl, timer::timg::TimerGroup,
 };
 
 // Provides the parallel port and display interface builders
@@ -63,7 +55,7 @@ extern crate alloc;
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[esp_hal_embassy::main]
+#[esp_rtos::main]
 async fn main(spawner: Spawner) {
     // generator version: 0.5.0
 
@@ -75,19 +67,32 @@ async fn main(spawner: Spawner) {
     esp_alloc::heap_allocator!(size: 64 * 1024);
     // COEX needs more RAM - so we've added some more
     esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 64 * 1024);
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0);
 
-    let timer0 = SystemTimer::new(peripherals.SYSTIMER);
-    esp_hal_embassy::init(timer0.alarm0);
+    // We must initialize some kind of interface and start it.
+    let (_controller, interfaces) =
+        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
 
-    info!("Embassy initialized!");
+    let mut sniffer = interfaces.sniffer;
+    sniffer.set_promiscuous_mode(true).unwrap();
+    sniffer.set_receive_cb(|packet| {
+        let _ = match_frames! {
+            packet.data,
+            beacon = BeaconFrame => {
+                let Some(ssid) = beacon.ssid() else {
+                    return;
+                };
+                if critical_section::with(|cs| {
+                    KNOWN_SSIDS.borrow_ref_mut(cs).insert(ssid.to_string())
+                }) {
+                    println!("Found new AP with SSID: {ssid}");
+                }
+            }
+        };
+    });
 
-    let timer1 = TimerGroup::new(peripherals.TIMG0);
-    let wifi_init =
-        esp_wifi::init(timer1.timer0, rng).expect("Failed to initialize WIFI/BLE controller");
-    let (mut _wifi_controller, interfaces) = esp_wifi::wifi::new(&wifi_init, peripherals.WIFI)
-        .expect("Failed to initialize WIFI controller");
-    let sniffer = interfaces.sta.capabilities();
-    info!("{:?}", sniffer);
     // // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
     // let transport = BleConnector::new(&wifi_init, peripherals.BT);
     // let rng = esp_hal::rng::Rng::new(peripherals.RNG);
