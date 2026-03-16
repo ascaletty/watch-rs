@@ -7,29 +7,20 @@
 )]
 use core::fmt::Alignment;
 use core::pin::Pin;
-
-use alloc::string::ToString;
+use core::time::Duration;
 
 use defmt::info;
-use embassy_executor::Spawner;
-use embassy_net::driver::Driver;
-use embassy_time::{Duration, Timer};
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::{ascii::FONT_6X10, MonoTextStyle};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::{Baseline, TextStyleBuilder};
-use esp_hal::gpio::OutputPin;
 use esp_hal::i2c::master::{AnyI2c, Config, I2c};
-use esp_hal::ledc::timer;
 use esp_hal::spi::master::Config as SConfig;
-use esp_hal::timer::systimer::SystemTimer;
-use esp_hal::timer::timg::TimerGroup;
-use esp_hal::{clock, peripherals, rng, spi, Async, Blocking, DriverMode};
 use esp_hal::{clock::CpuClock, gpio::OutputConfig};
+use esp_radio::wifi::{Interfaces, WifiEvent};
 use ieee80211::{match_frames, mgmt_frame::BeaconFrame};
 use mipidsi::options::Orientation;
-use mipidsi::Display;
 use panic_rtt_target as _;
 
 use embedded_graphics::{
@@ -38,60 +29,67 @@ use embedded_graphics::{
     primitives::{Circle, Primitive, PrimitiveStyle, Triangle},
     text::Text,
 };
-use esp_hal::{
-    clock::CpuClock, interrupt::software::SoftwareInterruptControl, timer::timg::TimerGroup,
-};
-
-// Provides the parallel port and display interface builders
-use mipidsi::interface::SpiInterface;
-
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
-
-// Provides the Display builder
+use esp_hal::gpio::{Level, Output};
+use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::spi::master::Spi;
+use esp_hal::timer::AnyTimer;
+// Provides the parallel port and display interface buildersk
+use esp_radio::wifi::ScanConfig;
+use mipidsi::interface::SpiInterface;
 use mipidsi::{models::ST7789, Builder};
 extern crate alloc;
-
+use core::cell::RefCell;
+use critical_section::Mutex;
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
+use alloc::{
+    collections::btree_set::BTreeSet,
+    string::{String, ToString},
+};
+use esp_hal::delay::Delay;
+use esp_radio::wifi::ClientConfig;
+static KNOWN_SSIDS: Mutex<RefCell<BTreeSet<String>>> = Mutex::new(RefCell::new(BTreeSet::new()));
+
+const SSID: &str = "Scaletty";
+const PASSWORD: &str = "ALCS2014";
+const NTP_SERVER: &str = "pool.ntp.org";
+use esp_hal::timer::timg::TimerGroup;
+use static_cell::StaticCell;
+static WCONTROLLER: StaticCell<WifiController> = StaticCell::new();
+static CONTROLLER: StaticCell<esp_radio::Controller> = StaticCell::new();
+use esp_radio::wifi::AuthMethod;
 
 #[esp_rtos::main]
-async fn main(spawner: Spawner) {
+async fn main(spawner: embassy_executor::Spawner) {
     // generator version: 0.5.0
-
     rtt_target::rtt_init_defmt!();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 72 * 1024);
     // COEX needs more RAM - so we've added some more
     esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 64 * 1024);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0);
+    let station_config = ClientConfig::default()
+        .with_ssid(SSID.to_string())
+        .with_password(PASSWORD.into())
+        .with_auth_method(AuthMethod::Wpa2Personal);
 
+    let controller = CONTROLLER.init(esp_radio::init().unwrap());
+
+    let (mut controller, interfaces) =
+        esp_radio::wifi::new(controller, peripherals.WIFI, Default::default()).unwrap();
+
+    controller.set_config(&esp_radio::wifi::ModeConfig::Client(station_config));
+    let controller_ref = WCONTROLLER.init(controller);
+    info!("Scan");
+    spawner.spawn(connection(controller_ref)).ok();
     // We must initialize some kind of interface and start it.
-    let (_controller, interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
-
-    let mut sniffer = interfaces.sniffer;
-    sniffer.set_promiscuous_mode(true).unwrap();
-    sniffer.set_receive_cb(|packet| {
-        let _ = match_frames! {
-            packet.data,
-            beacon = BeaconFrame => {
-                let Some(ssid) = beacon.ssid() else {
-                    return;
-                };
-                if critical_section::with(|cs| {
-                    KNOWN_SSIDS.borrow_ref_mut(cs).insert(ssid.to_string())
-                }) {
-                    println!("Found new AP with SSID: {ssid}");
-                }
-            }
-        };
-    });
 
     // // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
     // let transport = BleConnector::new(&wifi_init, peripherals.BT);
@@ -110,7 +108,11 @@ async fn main(spawner: Spawner) {
     //LCD BL GPIO15
     //Buzz GPIO42
     //BAT ADC GPIO1
-    let dc = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
+    let dc = esp_hal::gpio::Output::new(
+        peripherals.GPIO4,
+        esp_hal::gpio::Level::Low,
+        OutputConfig::default(),
+    );
     // Define the reset pin as digital outputs and make it high
     let mut rst = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
 
@@ -136,7 +138,6 @@ async fn main(spawner: Spawner) {
     display.set_orientation(Orientation::default()).unwrap();
     // display.sleep(&mut delay).unwrap();
     display.clear(Rgb565::new(200, 200, 200)).unwrap();
-    info!("cleared display");
 
     let style = PrimitiveStyleBuilder::new()
         .stroke_color(Rgb565::RED)
@@ -144,7 +145,6 @@ async fn main(spawner: Spawner) {
         .fill_color(Rgb565::GREEN)
         .build();
 
-    info!("Hello world!");
     Rectangle::new(Point::new(30, 20), Size::new(10, 15))
         .into_styled(style)
         .draw(&mut display)
@@ -161,8 +161,6 @@ async fn main(spawner: Spawner) {
     let mut prev = [' '; 8]; // "HH:MM:SS"
     loop {
         let hour = clock.get_datetime().await.unwrap().to_string();
-
-        info!("hour: {}", &hour.as_str());
 
         let dt = clock.get_datetime().await.unwrap();
 
@@ -205,11 +203,55 @@ async fn main(spawner: Spawner) {
                 prev[i] = now[i];
             }
         }
-
-        Timer::after_secs(1).await;
     }
 
     // Create a text at position (20, 30) and draw it using the previously defined style
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.0/examples/src/bin
+}
+#[embassy_executor::task]
+async fn sniffer(interfaces: Interfaces<'static>) {
+    let mut sniffer = interfaces.sniffer;
+
+    sniffer.set_promiscuous_mode(true).unwrap();
+    sniffer.set_receive_cb(|packet| {
+        let _ = match_frames! {
+            packet.data,
+            beacon = BeaconFrame => {
+                let Some(ssid) = beacon.ssid() else {
+                    return;
+                };
+                if critical_section::with(|cs| {
+                    KNOWN_SSIDS.borrow_ref_mut(cs).insert(ssid.to_string())
+                }) {
+                    info!("Found new AP with SSID: {}", ssid);
+                }
+            }
+        };
+    });
+}
+use esp_radio::wifi::WifiController;
+#[embassy_executor::task]
+async fn connection(mut controller: &'static mut WifiController<'static>) {
+    info!("start connection task");
+
+    loop {
+        info!("About to connect...");
+        if !matches!(controller.is_started(), Ok(true)) {
+            controller.start_async().await.unwrap();
+            info!("WiFi started");
+        }
+        match controller.connect_async().await {
+            Ok(info) => {
+                info!("Wifi connected to {:?}", info);
+
+                // wait until we're no longer connected
+                controller.wait_for_event(WifiEvent::StaDisconnected).await;
+                info!("Disconnected");
+            }
+            Err(e) => {
+                info!("error, {}", e)
+            }
+        }
+    }
 }
