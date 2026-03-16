@@ -10,15 +10,17 @@ use core::pin::Pin;
 use core::time::Duration;
 
 use defmt::info;
+use embassy_time::Timer;
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::{ascii::FONT_6X10, MonoTextStyle};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::{Baseline, TextStyleBuilder};
 use esp_hal::i2c::master::{AnyI2c, Config, I2c};
+use esp_hal::ledc::channel::config;
 use esp_hal::spi::master::Config as SConfig;
 use esp_hal::{clock::CpuClock, gpio::OutputConfig};
-use esp_radio::wifi::{Interfaces, WifiEvent};
+use esp_radio::wifi::{Interfaces, WifiDevice, WifiEvent};
 use ieee80211::{match_frames, mgmt_frame::BeaconFrame};
 use mipidsi::options::Orientation;
 use panic_rtt_target as _;
@@ -59,8 +61,33 @@ use esp_hal::timer::timg::TimerGroup;
 use static_cell::StaticCell;
 static WCONTROLLER: StaticCell<WifiController> = StaticCell::new();
 static CONTROLLER: StaticCell<esp_radio::Controller> = StaticCell::new();
+use core::net::{IpAddr, SocketAddr};
+use defmt::error;
+use embassy_net::{Config as NetConfig, DhcpConfig};
+use esp_hal::rtc_cntl::Rtc;
 use esp_radio::wifi::AuthMethod;
+use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
+use sntpc_net_embassy::UdpSocketWrapper;
+#[derive(Clone, Copy)]
+struct Timestamp<'a> {
+    rtc: &'a Rtc<'a>,
+    current_time_us: u64,
+}
 
+impl NtpTimestampGenerator for Timestamp<'_> {
+    fn init(&mut self) {
+        self.current_time_us = self.rtc.current_time_us();
+    }
+
+    fn timestamp_sec(&self) -> u64 {
+        self.current_time_us / 1_000_000
+    }
+
+    fn timestamp_subsec_micros(&self) -> u32 {
+        (self.current_time_us % 1_000_000) as u32
+    }
+}
+use esp_hal::rng::Rng;
 #[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) {
     // generator version: 0.5.0
@@ -68,6 +95,7 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+    let rtc = Rtc::new(peripherals.LPWR);
 
     esp_alloc::heap_allocator!(size: 72 * 1024);
     // COEX needs more RAM - so we've added some more
@@ -85,13 +113,90 @@ async fn main(spawner: embassy_executor::Spawner) {
     let (mut controller, interfaces) =
         esp_radio::wifi::new(controller, peripherals.WIFI, Default::default()).unwrap();
 
-    controller.set_config(&esp_radio::wifi::ModeConfig::Client(station_config));
+    controller
+        .set_config(&esp_radio::wifi::ModeConfig::Client(station_config))
+        .ok();
     let controller_ref = WCONTROLLER.init(controller);
-    info!("Scan");
-    spawner.spawn(connection(controller_ref)).ok();
-    // We must initialize some kind of interface and start it.
+    static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 
-    // // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
+    // Create TUN/TAP device
+
+    // Configure network stack
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let config = embassy_net::Config::dhcpv4(DhcpConfig::default());
+    // Init network stack
+    let (stack, runner) = embassy_net::new(
+        interfaces.sta,
+        config,
+        RESOURCES.init(StackResources::new()),
+        seed,
+    );
+
+    spawner.spawn(connection(controller_ref)).ok();
+
+    spawner.spawn(net_task(runner)).ok();
+    stack.wait_config_up().await;
+    info!("IP config: {:?}", stack.config_v4());
+    info!("network ready!!");
+    Timer::after_secs(2).await;
+    // let mut rx_meta = [PacketMetadata::EMPTY; 16];
+    // let mut rx_buffer = [0; 4096];
+    // let mut tx_meta = [PacketMetadata::EMPTY; 16];
+    // let mut tx_buffer = [0; 4096];
+    let mut rx_meta = [PacketMetadata::EMPTY; 32];
+    let mut rx_buffer = [0; 8192];
+
+    let mut tx_meta = [PacketMetadata::EMPTY; 32];
+    let mut tx_buffer = [0; 8192];
+
+    let mut socket = UdpSocket::new(
+        stack,
+        &mut rx_meta,
+        &mut rx_buffer,
+        &mut tx_meta,
+        &mut tx_buffer,
+    );
+    socket.bind(0).unwrap();
+    info!("socket binded");
+    let socket = UdpSocketWrapper::new(socket);
+
+    let ntp_addrs = stack
+        .dns_query(NTP_SERVER, DnsQueryType::A)
+        .await
+        .expect("Failed to resolve DNS");
+    if ntp_addrs.is_empty() {
+        error!("Failed to resolve DNS");
+        return;
+    }
+    info!("dns dns_query");
+    info!("NTP addr {:?}", ntp_addrs[0]);
+    let server = SocketAddr::new(IpAddr::from(ntp_addrs[0]), 123);
+    let ntp_time = get_time(
+        server,
+        &socket,
+        NtpContext::new(Timestamp {
+            rtc: &rtc,
+            current_time_us: 0,
+        }),
+    )
+    .await
+    .unwrap();
+    info!("packet left");
+    let mut nowtime = jiff::Timestamp::from_second(ntp_time.sec() as i64).unwrap();
+    let mut zdt = nowtime.to_zoned(jiff::tz::TimeZone::UTC);
+    zdt -= jiff::Span::new().hours(5);
+
+    let hour = zdt.hour();
+    let minute = zdt.minute();
+    let second = zdt.second();
+
+    let year = zdt.year();
+    let month = zdt.month();
+    let day = zdt.day();
+    info!("Time is {}:{}", hour, minute);
+    info!("date is {}/{}/{}", month, day, year);
+
     // let transport = BleConnector::new(&wifi_init, peripherals.BT);
     // let rng = esp_hal::rng::Rng::new(peripherals.RNG);
     // let _ble_controller = ExternalController::<_, 20>::new(transport);
@@ -158,24 +263,20 @@ async fn main(spawner: embassy_executor::Spawner) {
     let mut clock = pcf85063a::PCF85063::new(clockd);
     clock.perform_software_reset().await.unwrap();
     clock.start_clock().await.unwrap();
-    let mut prev = [' '; 8]; // "HH:MM:SS"
+    let mut now = [' '; 8];
     loop {
-        let hour = clock.get_datetime().await.unwrap().to_string();
-
-        let dt = clock.get_datetime().await.unwrap();
-
-        let mut now = [' '; 8];
-
-        now[0] = char::from_digit((dt.hour() / 10) as u32, 10).unwrap();
-        now[1] = char::from_digit((dt.hour() % 10) as u32, 10).unwrap();
-        now[2] = ':';
-        now[3] = char::from_digit((dt.minute() / 10) as u32, 10).unwrap();
-        now[4] = char::from_digit((dt.minute() % 10) as u32, 10).unwrap();
-        now[5] = ':';
-        now[6] = char::from_digit((dt.second() / 10) as u32, 10).unwrap();
-        now[7] = char::from_digit((dt.second() % 10) as u32, 10).unwrap();
         let char_width = 12;
 
+        let mut prev = [' '; 8];
+
+        prev[0] = char::from_digit((zdt.hour() / 10) as u32, 10).unwrap();
+        prev[1] = char::from_digit((zdt.hour() % 10) as u32, 10).unwrap();
+        prev[2] = ':';
+        prev[3] = char::from_digit((zdt.minute() / 10) as u32, 10).unwrap();
+        prev[4] = char::from_digit((zdt.minute() % 10) as u32, 10).unwrap();
+        prev[5] = ':';
+        prev[6] = char::from_digit((zdt.second() / 10) as u32, 10).unwrap();
+        prev[7] = char::from_digit((zdt.second() % 10) as u32, 10).unwrap();
         for i in 0..8 {
             if now[i] != prev[i] {
                 let x = 60 + i as i32 * char_width;
@@ -190,7 +291,7 @@ async fn main(spawner: embassy_executor::Spawner) {
                     .unwrap();
 
                 let mut buf = [0u8; 1];
-                buf[0] = now[i] as u8;
+                buf[0] = prev[i] as u8;
 
                 Text::new(
                     core::str::from_utf8(&buf).unwrap(),
@@ -200,9 +301,11 @@ async fn main(spawner: embassy_executor::Spawner) {
                 .draw(&mut display)
                 .unwrap();
 
-                prev[i] = now[i];
+                now[i] = prev[i];
             }
         }
+        embassy_time::Timer::after_secs(1).await;
+        zdt += jiff::Span::new().seconds(1);
     }
 
     // Create a text at position (20, 30) and draw it using the previously defined style
@@ -232,26 +335,39 @@ async fn sniffer(interfaces: Interfaces<'static>) {
 }
 use esp_radio::wifi::WifiController;
 #[embassy_executor::task]
-async fn connection(mut controller: &'static mut WifiController<'static>) {
-    info!("start connection task");
+async fn connection(controller: &'static mut WifiController<'static>) {
+    info!("wifi task started");
+
+    controller.start_async().await.unwrap();
+    info!("wifi started");
 
     loop {
-        info!("About to connect...");
-        if !matches!(controller.is_started(), Ok(true)) {
-            controller.start_async().await.unwrap();
-            info!("WiFi started");
-        }
+        info!("connecting...");
+
         match controller.connect_async().await {
             Ok(info) => {
-                info!("Wifi connected to {:?}", info);
+                info!("connected {:?}", info);
 
-                // wait until we're no longer connected
+                // Wait until WiFi disconnects
                 controller.wait_for_event(WifiEvent::StaDisconnected).await;
-                info!("Disconnected");
+
+                info!("wifi disconnected");
             }
+
             Err(e) => {
-                info!("error, {}", e)
+                info!("connect error: {:?}", e);
             }
         }
+
+        // Prevent reconnect storms
+        Timer::after_secs(3).await;
     }
+}
+use embassy_net::dns::DnsQueryType;
+use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::{Config as EConfig, Ipv4Address, Ipv4Cidr, StackResources};
+use heapless::Vec;
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, WifiDevice<'static>>) -> ! {
+    runner.run().await
 }

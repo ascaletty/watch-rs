@@ -6,7 +6,7 @@
 #![no_main]
 
 #[cfg(test)]
-#[embedded_test::tests(executor = esp_hal_embassy::Executor::new())]
+#[embedded_test::tests(executor = embassy_executor::Executor::new())]
 mod tests {
     use defmt::assert_eq;
     use esp_hal::timer::systimer::SystemTimer;
@@ -16,7 +16,6 @@ mod tests {
         let peripherals = esp_hal::init(esp_hal::Config::default());
 
         let timer0 = SystemTimer::new(peripherals.SYSTIMER);
-        esp_hal_embassy::init(timer0.alarm0);
 
         rtt_target::rtt_init_defmt!();
     }
