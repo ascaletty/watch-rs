@@ -10,6 +10,7 @@ use core::pin::Pin;
 use core::time::Duration;
 
 use defmt::info;
+use embassy_executor::SpawnError;
 use embassy_time::Timer;
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::{ascii::FONT_6X10, MonoTextStyle};
@@ -22,6 +23,7 @@ use esp_hal::spi::master::Config as SConfig;
 use esp_hal::{clock::CpuClock, gpio::OutputConfig};
 use esp_radio::wifi::{Interfaces, WifiDevice, WifiEvent};
 use ieee80211::{match_frames, mgmt_frame::BeaconFrame};
+use jiff::civil::Time;
 use mipidsi::options::Orientation;
 use panic_rtt_target as _;
 
@@ -54,8 +56,8 @@ use esp_hal::delay::Delay;
 use esp_radio::wifi::ClientConfig;
 static KNOWN_SSIDS: Mutex<RefCell<BTreeSet<String>>> = Mutex::new(RefCell::new(BTreeSet::new()));
 
-const SSID: &str = "Scaletty";
-const PASSWORD: &str = "ALCS2014";
+const SSID: &str = "MyResNet-2G";
+const PASSWORD: &str = "January67!";
 const NTP_SERVER: &str = "pool.ntp.org";
 use esp_hal::timer::timg::TimerGroup;
 use static_cell::StaticCell;
@@ -87,15 +89,48 @@ impl NtpTimestampGenerator for Timestamp<'_> {
         (self.current_time_us % 1_000_000) as u32
     }
 }
+use esp_hal::analog::adc::{Adc, AdcConfig, Attenuation};
 use esp_hal::rng::Rng;
 #[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) {
     // generator version: 0.5.0
     rtt_target::rtt_init_defmt!();
+    use esp_hal::efuse::Efuse;
+
+    let mac = Efuse::mac_address();
+
+    defmt::info!(
+        "MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+    let mut powerin = Output::new(peripherals.GPIO41, Level::Low, OutputConfig::default());
+    powerin.set_high();
     let rtc = Rtc::new(peripherals.LPWR);
+    let mut adc_config = AdcConfig::new();
+
+    // GPIO1 = BAT_ADC
+    let mut bat_pin = adc_config.enable_pin(peripherals.GPIO1, Attenuation::_0dB);
+
+    let mut adc = Adc::new(peripherals.ADC1, adc_config);
+
+    // read raw value
+    let raw: u16 = adc.read_blocking(&mut bat_pin);
+
+    // convert to voltage (ESP32 ADC is ~0–3.3V)
+    let v_adc = (raw as f32 / 4095.0) * 3.3;
+
+    // scale back to battery voltage
+    let v_bat = v_adc * 3.0;
+
+    defmt::info!("Battery voltage: {} V", v_bat);
 
     esp_alloc::heap_allocator!(size: 72 * 1024);
     // COEX needs more RAM - so we've added some more
@@ -126,6 +161,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
     let config = embassy_net::Config::dhcpv4(DhcpConfig::default());
     // Init network stack
+
     let (stack, runner) = embassy_net::new(
         interfaces.sta,
         config,
@@ -263,20 +299,33 @@ async fn main(spawner: embassy_executor::Spawner) {
     let mut clock = pcf85063a::PCF85063::new(clockd);
     clock.perform_software_reset().await.unwrap();
     clock.start_clock().await.unwrap();
+    clock
+        .set_time(
+            &time::Time::from_hms(
+                zdt.hour().unsigned_abs(),
+                zdt.minute().unsigned_abs(),
+                zdt.second().unsigned_abs(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
     let mut now = [' '; 8];
     loop {
         let char_width = 12;
 
         let mut prev = [' '; 8];
+        let clocktime = clock.get_datetime().await.unwrap();
 
-        prev[0] = char::from_digit((zdt.hour() / 10) as u32, 10).unwrap();
-        prev[1] = char::from_digit((zdt.hour() % 10) as u32, 10).unwrap();
+        prev[0] = char::from_digit((clocktime.hour() / 10) as u32, 10).unwrap();
+        prev[1] = char::from_digit((clocktime.hour() % 10) as u32, 10).unwrap();
         prev[2] = ':';
-        prev[3] = char::from_digit((zdt.minute() / 10) as u32, 10).unwrap();
-        prev[4] = char::from_digit((zdt.minute() % 10) as u32, 10).unwrap();
+        prev[3] = char::from_digit((clocktime.minute() / 10) as u32, 10).unwrap();
+        prev[4] = char::from_digit((clocktime.minute() % 10) as u32, 10).unwrap();
         prev[5] = ':';
-        prev[6] = char::from_digit((zdt.second() / 10) as u32, 10).unwrap();
-        prev[7] = char::from_digit((zdt.second() % 10) as u32, 10).unwrap();
+        prev[6] = char::from_digit((clocktime.second() / 10) as u32, 10).unwrap();
+        prev[7] = char::from_digit((clocktime.second() % 10) as u32, 10).unwrap();
         for i in 0..8 {
             if now[i] != prev[i] {
                 let x = 60 + i as i32 * char_width;
@@ -304,8 +353,6 @@ async fn main(spawner: embassy_executor::Spawner) {
                 now[i] = prev[i];
             }
         }
-        embassy_time::Timer::after_secs(1).await;
-        zdt += jiff::Span::new().seconds(1);
     }
 
     // Create a text at position (20, 30) and draw it using the previously defined style
@@ -347,7 +394,6 @@ async fn connection(controller: &'static mut WifiController<'static>) {
         match controller.connect_async().await {
             Ok(info) => {
                 info!("connected {:?}", info);
-
                 // Wait until WiFi disconnects
                 controller.wait_for_event(WifiEvent::StaDisconnected).await;
 
@@ -371,3 +417,4 @@ use heapless::Vec;
 async fn net_task(mut runner: embassy_net::Runner<'static, WifiDevice<'static>>) -> ! {
     runner.run().await
 }
+extern crate gyro;
